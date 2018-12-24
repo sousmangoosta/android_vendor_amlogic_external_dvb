@@ -159,6 +159,8 @@ extern "C"
 #define AM_SI_DESCR_LCN_83                      (0x83)
 #define AM_SI_DESCR_LCN_87                      (0x87)
 #define AM_SI_DESCR_LCN_88                      (0x88)
+#define AM_SI_DESCR_ISDBSUBTITLING				(0xfd)
+
 
 /**\brief ATSC Table types*/
 #define AM_SI_ATSC_TT_CURRENT_TVCT	0x0
@@ -193,6 +195,8 @@ extern "C"
 #define AM_SI_MAX_TTX_CNT 32
 /**\brief Maximum number of single Program supported caption*/
 #define AM_SI_MAX_CAP_CNT 32
+/**\brief Maximum number of single Program supported isdb subtitle*/
+#define AM_SI_MAX_ISDB_SUB_CNT 8
 
 #define SECS_BETWEEN_1JAN1970_6JAN1980 (315964800)
 
@@ -213,7 +217,7 @@ enum AM_SI_ErrorCode
 };
 
 /**\brief section head define*/
-typedef struct 
+typedef struct
 {
 	uint8_t		table_id;			/**< table_id*/
 	uint8_t		syntax_indicator;	/**< section_syntax_indicator*/
@@ -277,6 +281,17 @@ typedef struct
 		char lang[16];		/**<the language of teletext*/
 	}teletexts[AM_SI_MAX_TTX_CNT];/**<teletext info*/
 }AM_SI_TeletextInfo_t;
+/**\brief isdb subtitle info type*/
+typedef struct
+{
+	int isdb_count;	/**<isdb subtitle count*/
+	struct
+	{
+		int pid;					/**<isdb subtitle stream pid*/
+		int type;					/**<isdb subtitle type*/
+		char lang[16];		/**<the language of isdb subtitle*/
+	}isdbs[AM_SI_MAX_ISDB_SUB_CNT];/**<isdb subtitle info*/
+}AM_SI_IsdbsubtitleInfo_t;
 /**\brief caption info type*/
 typedef struct
 {
@@ -287,12 +302,13 @@ typedef struct
 		int service_number;	/**<caption service number*/
 		int pid_or_line21;  /**<line21 for analog / es pid for digital*/
 		int flags;                  /**<easy reader(mask:0x80) / wide aspect ratio(mask:0x40) for digital*/
+		unsigned int private_data;
 		char lang[16];		/**<the language of caption for digital*/
 	}captions[AM_SI_MAX_CAP_CNT];/**<caption info*/
 }AM_SI_CaptionInfo_t;
 
 /****************************************************************************
- * Function prototypes  
+ * Function prototypes
  ***************************************************************************/
 
 /**\brief creat a parser of parse si

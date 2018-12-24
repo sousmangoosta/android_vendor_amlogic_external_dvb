@@ -111,6 +111,7 @@ enum AM_AV_EventType
 	AM_AV_EVT_VIDEO_NOT_SUPPORT,        /**< Video format is not supported*/
 	AM_AV_EVT_VIDEO_AVAILABLE,  /**< Cannot get valid video information*/
 	AM_AV_EVT_AUDIO_CB, /**< Audio function will implement in cb */
+	AM_AV_EVT_VIDEO_RESOLUTION_CHANGED, /**< Video resolution changed, the parameter is the AM_AV_VideoStatus_t with new width&height valid only */
 	AM_AV_EVT_END
 };
 
@@ -161,6 +162,7 @@ typedef enum
 	AM_AV_TS_SRC_TS1,                    /**< TS input port 1*/
 	AM_AV_TS_SRC_TS2,                    /**< TS input port 2*/
 	AM_AV_TS_SRC_HIU,                    /**< HIU port (file input)*/
+	AM_AV_TS_SRC_HIU1,
 	AM_AV_TS_SRC_DMX0,                   /**< Demux 0*/
 	AM_AV_TS_SRC_DMX1,                   /**< Demux 1*/
 	AM_AV_TS_SRC_DMX2                    /**< Demux 2*/
@@ -387,6 +389,7 @@ typedef struct
 	int              vb_size;     /**< Video buffer size*/
 	int              vb_data;     /**< Data size in the video buffer*/
 	int              vb_free;     /**< Free size in the video buffer*/
+	AM_AV_VideoAspectRatio_t vid_ratio; /**< Video source aspect ratio*/
 }AM_AV_VideoStatus_t;
 
 /**\brief Audio decoder status*/
@@ -1176,6 +1179,24 @@ typedef struct _AUDIO_STATUS_
 typedef void (*AM_AV_Audio_CB_t)(int event_type, AudioParms* parm, void *user_data);
 
 extern AM_ErrorCode_t AM_AV_SetAudioCallback(int dev_no,AM_AV_Audio_CB_t cb,void *user_data);
+
+/**
+ * brief Get current video pts
+ * \param dev_no AV decoder device number
+ * \param[out] Return the 33-bit pts value
+ * \retval AM_SUCCESS On success
+ * \return Error code
+ */
+extern AM_ErrorCode_t AM_AV_GetVideoPts(int dev_no, uint64_t *pts);
+
+/**
+ * brief Get current audio pts
+ * \param dev_no AV decoder device number
+ * \param[out] Return the 33-bit pts value
+ * \retval AM_SUCCESS On success
+ * \return Error code
+ */
+extern AM_ErrorCode_t AM_AV_GetAudioPts(int dev_no, uint64_t *pts);
 
 #ifdef __cplusplus
 }

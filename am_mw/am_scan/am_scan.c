@@ -4007,7 +4007,8 @@ static AM_ErrorCode_t am_scan_atv_step_tune(AM_SCAN_Scanner_t *scanner)
 		do
 		{
 			/* Auto/Manual scan reach the max freq ? */
-			if ((int)dvb_fend_para(cur_fe_para)->frequency >= scanner->atvctl.max_freq &&
+			if ((((int)dvb_fend_para(cur_fe_para)->frequency >= scanner->atvctl.max_freq && (scanner->atvctl.direction == 1))
+				|| ((int)dvb_fend_para(cur_fe_para)->frequency <= scanner->atvctl.max_freq && (scanner->atvctl.direction == 0))) &&
 				(atv_start_para.mode == AM_SCAN_ATVMODE_AUTO || atv_start_para.mode == AM_SCAN_ATVMODE_MANUAL))
 			{
 				AM_DEBUG(1, "ATV auto/manual scan reach max freq.");
@@ -4353,7 +4354,7 @@ static void am_scan_blind_scan_callback(int dev_no, AM_FEND_BlindEvent_t *evt, v
 		struct dvb_frontend_parameters tps[AM_SCAN_MAX_BS_TP_CNT];
 		struct dvb_frontend_parameters *new_tp_start;
 
-		AM_FEND_BlindGetTPInfo(scanner->start_para.fend_dev_id, tps, (unsigned int*)&cnt);
+		AM_FEND_BlindGetTPInfo(scanner->start_para.fend_dev_id, tps, (unsigned int)cnt);
 
 		if (cnt > scanner->dtvctl.bs_ctl.get_tp_cnt)
 		{

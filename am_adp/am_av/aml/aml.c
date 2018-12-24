@@ -71,8 +71,9 @@
 #define FILENAME_LENGTH_MAX 2048
 
 #include <codec_type.h>
-//#include <adec-external-ctrl.h>
-
+#ifdef USE_ADEC_IN_DVB
+#include <adec-external-ctrl.h>
+#endif
 void *adec_handle = NULL;
 
 #ifndef TRICKMODE_NONE
@@ -105,7 +106,7 @@ void *adec_handle = NULL;
 #define UP_RESAMPLE_AUDIO_LEVEL      128
 #define UP_RESAMPLE_VIDEO_LEVEL      1024
 #define DOWN_RESAMPLE_CACHE_TIME     90000*2
-#define NO_DATA_CHECK_TIME           2000*2
+#define NO_DATA_CHECK_TIME           2000
 #define VMASTER_REPLAY_TIME          4000
 #define SCRAMBLE_CHECK_TIME          1000
 #define TIMESHIFT_INJECT_DIFF_TIME	 4
@@ -173,6 +174,8 @@ void *adec_handle = NULL;
 #define RESAMPLE_TYPE_FILE      "/sys/class/amaudio/resample_type"
 #define AUDIO_DMX_PTS_FILE	"/sys/class/stb/audio_pts"
 #define VIDEO_DMX_PTS_FILE	"/sys/class/stb/video_pts"
+#define AUDIO_DMX_PTS_BIT32_FILE	"/sys/class/stb/audio_pts_bit32"
+#define VIDEO_DMX_PTS_BIT32_FILE	"/sys/class/stb/video_pts_bit32"
 #define AUDIO_PTS_FILE	"/sys/class/tsync/pts_audio"
 #define VIDEO_PTS_FILE	"/sys/class/tsync/pts_video"
 #define TSYNC_MODE_FILE "/sys/class/tsync/mode"
@@ -247,6 +250,8 @@ void *adec_handle = NULL;
 #define AV_THRESHOLD_MAX_FILE "/sys/class/tsync/av_threshold_max"
 #define TSYNC_FIRSTCHECKIN_APTS_FILE "/sys/class/tsync/checkin_firstapts"
 #define TSYNC_FIRSTCHECKIN_VPTS_FILE "/sys/class/tsync/checkin_firstvpts"
+#define AUDIO_DMX_PTS_BIT32_FILE	"/sys/class/stb/audio_pts_bit32"
+#define VIDEO_DMX_PTS_BIT32_FILE	"/sys/class/stb/video_pts_bit32"
 
 /*not find,android is not find*/
 #define AVS_PLUS_DECT_FILE "/sys/module/amvdec_avs/parameters/profile"
@@ -261,6 +266,7 @@ void *adec_handle = NULL;
 #define DEC_CONTROL_PROP "media.dec_control"
 #define AC3_AMASTER_PROP "media.ac3_amaster"
 #endif
+#define SHOW_FIRSTFRAME_NOSYNC_PROP "tv.dtv.showfirstframe_nosync"
 
 #define CANVAS_ALIGN(x)    (((x)+7)&~7)
 #define JPEG_WRTIE_UNIT    (32*1024)
@@ -312,6 +318,13 @@ static AM_ErrorCode_t set_dec_control(AM_Bool_t enable);
 #else
 #define VALID_AUDIO(_pid_, _fmt_) (VALID_PID(_pid_))
 #endif
+
+/*
+ * As not inlude "adec-external-ctrl.h", so we need declare
+ * audio_decode_set_volume. Otherwise it will lost the value of the second
+ * param, AKA volume.
+ */
+extern int audio_decode_set_volume(void *, float);
 /****************************************************************************
  * Type definitions
  ***************************************************************************/
@@ -438,6 +451,8 @@ typedef struct
 	AV_TSPlayPara_t		tp;
 
 	AV_TSData_t			ts;
+
+	int                     pause_time;
 } AV_TimeshiftData_t;
 
 struct AM_AUDIO_Driver
@@ -458,6 +473,11 @@ typedef struct AM_AUDIO_Driver  AM_AUDIO_Driver_t;
 
 static AM_AV_Audio_CB_t s_audio_cb = NULL;
 static void *pUserData = NULL;
+
+enum AV_SyncForce_e {
+	FORCE_NONE,
+	FORCE_AC3_AMASTER,
+};
 
 /****************************************************************************
  * Static data
@@ -494,6 +514,7 @@ static AM_ErrorCode_t aml_timeshift_get_tfile(AM_AV_Device_t *dev, AM_TFile_t *t
 static void 		  aml_set_audio_cb(AM_AV_Device_t *dev,AM_AV_Audio_CB_t cb,void *user_data);
 
 static int aml_restart_inject_mode(AM_AV_Device_t *dev, AM_Bool_t destroy_thread);
+static AM_ErrorCode_t aml_get_pts(AM_AV_Device_t *dev, int type, uint64_t *pts);
 
 const AM_AV_Driver_t aml_av_drv =
 {
@@ -524,6 +545,7 @@ const AM_AV_Driver_t aml_av_drv =
 .set_inject_subtitle = aml_set_inject_subtitle,
 .timeshift_get_tfile = aml_timeshift_get_tfile,
 .set_audio_cb = aml_set_audio_cb,
+.get_pts = aml_get_pts,
 };
 
 /*音频控制（通过解码器）操作*/
@@ -646,10 +668,8 @@ static AM_AUDIO_Driver_t *audio_ops = &callback_audio_drv;
 /*监控AV buffer, PTS 操作*/
 static pthread_mutex_t gAVMonLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gAVMonCond = PTHREAD_COND_INITIALIZER;
-static AM_Bool_t	gAVPcrEnable = AM_FALSE;
 
 static void* aml_av_monitor_thread(void *arg);
-static AM_ErrorCode_t aml_get_pts(const char *class_file,  uint32_t *pts);
 
 /*Timeshift 操作*/
 static void *aml_timeshift_thread(void *arg);
@@ -672,6 +692,8 @@ static dec_sysinfo_t am_sysinfo;
 
 
 static AM_ErrorCode_t aml_set_ad_source(AM_AD_Handle_t *ad, int enable, int pid, int fmt, void *user);
+static int aml_calc_sync_mode(AM_AV_Device_t *dev, int has_audio, int has_video, int afmt, int *force_reason);
+static int aml_set_sync_mode(AM_AV_Device_t *dev, int mode);
 
 /****************************************************************************
  * Static functions
@@ -707,6 +729,17 @@ static AM_Bool_t show_first_frame_nosync(void)
 	}
 
 	return AM_FALSE;
+}
+
+static void set_first_frame_nosync(void)
+{
+#ifdef ANDROID
+	int syncmode = property_get_int32(SHOW_FIRSTFRAME_NOSYNC_PROP, 1);
+	AM_DEBUG(1, "%s %d", __FUNCTION__,syncmode);
+	AM_FileEcho(VIDEO_SHOW_FIRSTFRM_NOSYNC_FILE, syncmode?"1":"0");
+#else
+	AM_FileEcho(VIDEO_SHOW_FIRSTFRM_NOSYNC_FILE, "1");
+#endif
 }
 
 static int get_amstream(AM_AV_Device_t *dev)
@@ -1050,7 +1083,9 @@ static void adec_start_decode(int fd, int fmt, int has_video, void **padec)
 			param.has_video = has_video;
 			param.associate_dec_supported = _get_asso_enable();
 			param.mixing_level = _get_asso_mix();
-			//param.use_hardabuf = 1; //should be use hardabuf ???
+#ifndef ANDROID
+			param.use_hardabuf = 1; //linux use hardabuf
+#endif
 			audio_decode_init(padec, &param);
 			audio_set_av_sync_threshold(*padec, AV_SYNC_THRESHOLD);
 			audio_decode_set_volume(*padec, 1.);
@@ -2184,10 +2219,10 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 	AV_TSData_t *ts = &tshift->ts;
 	AV_TSPlayPara_t *tp = &tshift->tp;
 	int val;
+	int sync_mode, sync_force;
 
 	AM_Bool_t has_video = VALID_VIDEO(tp->vpid, tp->vfmt);
 	AM_Bool_t has_audio = VALID_AUDIO(tp->apid, tp->afmt);
-	AM_Bool_t ac3_amaster = AM_FALSE;
 
 	AM_DEBUG(1, "aml start timeshift: V[%d:%d] A[%d:%d]", tp->vpid, tp->vfmt, tp->apid, tp->afmt);
 
@@ -2208,19 +2243,6 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 
 	/*patch dec control*/
 	set_dec_control(has_video);
-
-	if ((tp->afmt == AFORMAT_AC3) || (tp->afmt == AFORMAT_EAC3))
-	{
-		char buf[32];
-#ifdef ANDROID
-		property_get(AC3_AMASTER_PROP, buf, "0");
-#endif
-
-		if (!strcmp(buf, "1"))
-		{
-			ac3_amaster = AM_TRUE;
-		}
-	}
 
 	AM_DEBUG(1, "Openning demux%d",para->dmx_id);
 	snprintf(buf, sizeof(buf), "/dev/dvb0.demux%d", para->dmx_id);
@@ -2270,7 +2292,7 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 		AM_DEBUG(1, "cannot create data source \"/dev/amvideo\"");
 		return AM_AV_ERR_CANNOT_OPEN_DEV;
 	}
-	AM_DEBUG(1, "Setting play param");
+
 #if defined(ANDROID) || defined(CHIP_8626X)
 	/*Set tsync enable/disable*/
 	if (has_video && has_audio)
@@ -2285,6 +2307,7 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 	}
 #endif
 
+	AM_DEBUG(1, "Setting play param");
 	if (has_video) {
 		val = tp->vfmt;
 		if (ioctl(ts->fd, AMSTREAM_IOC_VFORMAT, val) == -1)
@@ -2355,7 +2378,10 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 		}
 	}
 
-	if (has_audio && !ac3_amaster) {
+	sync_mode = aml_calc_sync_mode(tshift->dev, has_audio, has_video, tp->afmt, &sync_force);
+	aml_set_sync_mode(tshift->dev, sync_mode);
+
+	if (has_audio && (sync_force != FORCE_AC3_AMASTER)) {
 		if (!show_first_frame_nosync()) {
 #ifdef ANDROID
 			//property_set("sys.amplayer.drop_pcm", "1");
@@ -2365,8 +2391,8 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 
 		audio_ops->adec_start_decode(ts->fd, tp->afmt, has_video, &ts->adec);
 
-		if (VALID_PID(tp->sub_apid))
-			aml_set_audio_ad(tshift->dev, 1, tp->sub_apid, tp->sub_afmt);
+		if (VALID_PID(tshift_para->sub_aud_pid))
+			aml_set_audio_ad(tshift->dev, 1, tshift_para->sub_aud_pid, tshift_para->sub_aud_fmt);
 	}
 
 	if (ioctl(ts->fd, AMSTREAM_IOC_PORT_INIT, 0) == -1)
@@ -2374,6 +2400,9 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 		AM_DEBUG(1, "amport init failed");
 		return AM_AV_ERR_SYS;
 	}
+
+	/*no blank for timeshifting play*/
+	AM_FileEcho(VID_BLACKOUT_FILE, "0");
 
 	if (create_thread)
 	{
@@ -2390,17 +2419,16 @@ static AM_ErrorCode_t aml_start_timeshift(AV_TimeshiftData_t *tshift, AV_TimeShi
 						(para->mode == AM_AV_TIMESHIFT_MODE_TIMESHIFTING && tshift->duration > 0),
 						tshift->duration,
 						0));
+			if (para->mode == AM_AV_TIMESHIFT_MODE_TIMESHIFTING) {
+				AM_TFile_TimeStart(tshift->file);
+				AM_DEBUG(1, "[timeshift] start TFile timer %p", tshift->file);
+			}
 		} else {
 			tshift->file = tshift_para->para.tfile;
 			tshift->offset = tshift_para->para.offset_ms;
 			tshift->file_flag |= TIMESHIFT_TFILE_DETACHED;
 			AM_EVT_Subscribe((long)tshift->file, AM_TFILE_EVT_RATE_CHANGED, tfile_evt_callback, tshift->dev);
 			AM_DEBUG(1, "[timeshift] using TFile %p", tshift->file);
-		}
-
-		if (para->mode == AM_AV_TIMESHIFT_MODE_TIMESHIFTING) {
-			AM_TFile_TimeStart(tshift->file);
-				AM_DEBUG(1, "[timeshift] start TFile timer %p", tshift->file);
 		}
 
 		if (! tshift->file->loop && tshift->duration)
@@ -2616,15 +2644,42 @@ static int aml_timeshift_resume_av(AV_TimeshiftData_t *tshift)
 	return 0;
 }
 
+static int aml_timeshift_do_cmd_start(AV_TimeshiftData_t *tshift, AM_AV_TimeshiftInfo_t *info)
+{
+	loff_t offset;
+
+	tshift->inject_size = 64*1024;
+	tshift->timeout = 0;
+	tshift->state = AV_TIMESHIFT_STAT_PLAY;
+	AM_DEBUG(1, "[timeshift] [start] seek to time %d s...", info->current_time);
+	if (tshift->para.para.mode == AM_AV_TIMESHIFT_MODE_TIMESHIFTING) {
+		AM_TFile_TimeSeek(tshift->file, info->current_time);
+	} else {//rec play
+		offset = (loff_t)info->current_time / 1000 * (loff_t)tshift->rate;
+		AM_TFile_Seek(tshift->file, offset);
+	}
+	ioctl(tshift->ts.vid_fd, AMSTREAM_IOC_TRICKMODE, TRICKMODE_NONE);
+	am_timeshift_reset(tshift, 2, AM_TRUE);
+
+	//if (tshift->last_cmd == AV_PLAY_FF || tshift->last_cmd == AV_PLAY_FB)
+	{
+		//usleep(200*1000);
+		AM_DEBUG(1, "set di bypass_all to 0");
+		AM_FileEcho("/sys/module/di/parameters/bypass_all","0");
+	}
+	aml_start_av_monitor(tshift->dev, &tshift->dev->timeshift_player.mon);
+	return 0;
+}
 
 static int aml_timeshift_do_play_cmd(AV_TimeshiftData_t *tshift, AV_PlayCmd_t cmd, AM_AV_TimeshiftInfo_t *info)
 {
 	AV_TimeshiftState_t	last_state = tshift->state;
 	loff_t offset;
 
-	if (! tshift->rate && (cmd == AV_PLAY_FF || cmd == AV_PLAY_FB || cmd == AV_PLAY_SEEK))
+	if ((tshift->para.para.mode != AM_AV_TIMESHIFT_MODE_TIMESHIFTING && !tshift->rate)
+        && (cmd == AV_PLAY_FF || cmd == AV_PLAY_FB || cmd == AV_PLAY_SEEK))
 	{
-		AM_DEBUG(1, "[timeshift] Have not got the rate, skip this command");
+		AM_DEBUG(1, "zzz [timeshift] Have not got the rate, skip this command");
 		return -1;
 	}
 
@@ -2633,30 +2688,9 @@ static int aml_timeshift_do_play_cmd(AV_TimeshiftData_t *tshift, AV_PlayCmd_t cm
 		switch (cmd)
 		{
 		case AV_PLAY_START:
-			//if (tshift->state != AV_TIMESHIFT_STAT_PLAY)
-			{
-				tshift->inject_size = 64*1024;
-				tshift->timeout = 0;
-				tshift->state = AV_TIMESHIFT_STAT_PLAY;
-				AM_DEBUG(1, "[timeshift] [start] seek to time %d s...", info->current_time);
-				if (tshift->para.para.mode == AM_AV_TIMESHIFT_MODE_TIMESHIFTING) {
-					AM_TFile_TimeSeek(tshift->file, info->current_time);
-				} else {//rec play
-					offset = (loff_t)info->current_time / 1000 * (loff_t)tshift->rate;
-					AM_TFile_Seek(tshift->file, offset);
-				}
-				ioctl(tshift->ts.vid_fd, AMSTREAM_IOC_TRICKMODE, TRICKMODE_NONE);
-				if (tshift->last_cmd != -1)
-					am_timeshift_reset(tshift, 2, AM_TRUE);
-
-				//if (tshift->last_cmd == AV_PLAY_FF || tshift->last_cmd == AV_PLAY_FB)
-				{
-					//usleep(200*1000);
-					AM_DEBUG(1, "set di bypass_all to 0");
-					AM_FileEcho(DI_BYPASS_ALL_FILE,"0");
-				}
-				aml_start_av_monitor(tshift->dev, &tshift->dev->timeshift_player.mon);
-			}
+			//if (tshift->state != AV_TIMESHIFT_STAT_PLAY) {
+				aml_timeshift_do_cmd_start(tshift, info);
+			//}
 			break;
 		case AV_PLAY_PAUSE:
 			//if (tshift->state != AV_TIMESHIFT_STAT_PAUSE)
@@ -2673,13 +2707,18 @@ static int aml_timeshift_do_play_cmd(AV_TimeshiftData_t *tshift, AV_PlayCmd_t cm
 		case AV_PLAY_RESUME:
 			if (tshift->state == AV_TIMESHIFT_STAT_PAUSE)
 			{
-				tshift->inject_size = 64*1024;
-				tshift->timeout = 0;
-				tshift->state = AV_TIMESHIFT_STAT_PLAY;
-				ioctl(tshift->ts.vid_fd, AMSTREAM_IOC_TRICKMODE, TRICKMODE_NONE);
-				aml_timeshift_resume_av(tshift);
-				aml_start_av_monitor(tshift->dev, &tshift->dev->timeshift_player.mon);
-				AM_DEBUG(1, "[timeshift] [resume]");
+				if (tshift->pause_time && tshift->current > tshift->pause_time) {
+					AM_DEBUG(1, "[timeshift] [resume] [replay]");
+					aml_timeshift_do_cmd_start(tshift, info);
+				} else {
+					tshift->inject_size = 64*1024;
+					tshift->timeout = 0;
+					tshift->state = AV_TIMESHIFT_STAT_PLAY;
+					ioctl(tshift->ts.vid_fd, AMSTREAM_IOC_TRICKMODE, TRICKMODE_NONE);
+					aml_timeshift_resume_av(tshift);
+					aml_start_av_monitor(tshift->dev, &tshift->dev->timeshift_player.mon);
+					AM_DEBUG(1, "[timeshift] [resume]");
+				}
 			}
 			break;
 		case AV_PLAY_FF:
@@ -2693,7 +2732,6 @@ static int aml_timeshift_do_play_cmd(AV_TimeshiftData_t *tshift, AV_PlayCmd_t cm
 				tshift->timeout = 0;
 				tshift->state = AV_TIMESHIFT_STAT_FFFB;
 				AM_DEBUG(1, "[timeshift] [fast] speed: %d", tshift->speed);
-				AM_FileEcho(VID_BLACKOUT_FILE, "0");
 				if (tshift->last_cmd == AV_PLAY_START)
 				{
 					AM_DEBUG(1, "set di bypass_all to 1");
@@ -2739,6 +2777,7 @@ static int aml_timeshift_do_play_cmd(AV_TimeshiftData_t *tshift, AV_PlayCmd_t cm
 			tshift->state = AV_TIMESHIFT_STAT_SEARCHOK;
 			break;
 #endif
+#if 0
 		case AV_PLAY_SWITCH_AUDIO:
 			/* just restart play using the new audio para */
 			AM_DEBUG(1, "[timeshift] [switch audio] pid=%d, fmt=%d",tshift->tp.apid, tshift->tp.afmt);
@@ -2760,6 +2799,7 @@ static int aml_timeshift_do_play_cmd(AV_TimeshiftData_t *tshift, AV_PlayCmd_t cm
 				tshift->state = AV_TIMESHIFT_STAT_SEARCHOK;
 			}
 			break;
+#endif
 		default:
 			AM_DEBUG(1, "[timeshift] Unsupported timeshift play command %d", cmd);
 			return -1;
@@ -2788,6 +2828,25 @@ static void aml_timeshift_update_info(AV_TimeshiftData_t *tshift, AM_AV_Timeshif
 	pthread_mutex_unlock(&tshift->lock);
 }
 
+static char *cmd2string(int cmd)
+{
+	char buf[64];
+	char *string_cmd[] = {
+	"play_start",        /*AV_PLAY_START*/
+	"play_pause",        /*AV_PLAY_PAUSE*/
+	"play_resume",       /*AV_PLAY_RESUME*/
+	"play_ff",           /*AV_PLAY_FF*/
+	"play_fb",           /*AV_PLAY_FB*/
+	"play_seek",         /*AV_PLAY_SEEK*/
+	"play_reset_vpath",  /*AV_PLAY_RESET_VPATH*/
+	"play_switch_audio"  /*AV_PLAY_SWITCH_AUDIO*/
+	};
+	if (cmd < 0 || cmd > AV_PLAY_SWITCH_AUDIO) {
+		sprintf(buf, "invalid cmd[%d]", cmd);
+		return buf;
+	}
+	return string_cmd[cmd];
+}
 /**\brief Timeshift 线程*/
 static void *aml_timeshift_thread(void *arg)
 {
@@ -2817,7 +2876,7 @@ static void *aml_timeshift_thread(void *arg)
 	tshift->last_cmd = -1;
 	if (tshift->para.para.start_paused) {
 		AM_DEBUG(1, "[timeshift] start in pause mode");
-		tshift->cmd = -1;
+		tshift->cmd = AV_PLAY_PAUSE;
 	}
 	AM_DEBUG(1, "Starting timeshift player thread ...");
 	info.status = AV_TIMESHIFT_STAT_INITOK;
@@ -2828,9 +2887,6 @@ static void *aml_timeshift_thread(void *arg)
 	aml_timeshift_notify_current(tshift, (void*)&info);
 
 	AM_TIME_GetClock(&update_time);
-
-	//AM_FileEcho(VID_BLACKOUT_FILE, "0");
-	AM_FileEcho(VID_BLACKOUT_FILE, tshift->dev->video_blackout ? "1" : "0");
 
 	while (tshift->running || tshift->cmd != tshift->last_cmd )
 	{
@@ -2846,10 +2902,11 @@ static void *aml_timeshift_thread(void *arg)
 			 * $ID: 101093,Fixed, timeshift resume decoder is stop when status from FastForward(or FastBack) to Pause directly
 			 */
 			AM_DEBUG(1, "[timeshift] last cmd is %s, cur_cmd is %s, do AV_PLAY_START first",
-					(tshift->last_cmd == AV_PLAY_FF)? "AV_PLAY_FF" : "AV_PLAY_FB",
-					(tshift->cmd == AV_PLAY_PAUSE)? "AV_PLAY_PAUSE" : "AV_PLAY_RESUME");
+					cmd2string(tshift->last_cmd),
+					cmd2string(tshift->cmd));
 			aml_timeshift_do_play_cmd(tshift, AV_PLAY_START, &info);
 		}
+		//AM_DEBUG(1, "zzz do cmd:%s", cmd2string(cmd));
 		aml_timeshift_do_play_cmd(tshift, cmd, &info);
 
 		/*read some bytes*/
@@ -2969,7 +3026,7 @@ static void *aml_timeshift_thread(void *arg)
 			else
 				trick_stat = 1;
 
-			AM_DEBUG(1, "[timeshift] trick_stat is %d", trick_stat);
+			AM_DEBUG(1, "[timeshift] trick_stat is %d vpts 0x%x", trick_stat, vpts);
 			if (trick_stat > 0)
 			{
 				AM_DEBUG(1, "[timeshift] last cmd:%d, state:%d", tshift->last_cmd, tshift->state);
@@ -3040,6 +3097,15 @@ static void *aml_timeshift_thread(void *arg)
 
 				aml_timeshift_update_info(tshift, &info);
 
+				if (tshift->last_cmd == AV_PLAY_PAUSE) {
+					if (tshift->pause_time == 0) {
+						tshift->pause_time = tshift->current;
+						AM_DEBUG(1, "zzz paused time: %d", tshift->pause_time);
+					}
+				} else {
+					tshift->pause_time = 0;
+				}
+
 				/*If there is no data available in playback only mode, we send exit event*/
 				if (is_playback_mode && !tshift->file->avail && tshift->state != AV_TIMESHIFT_STAT_PAUSE)
 				{
@@ -3082,7 +3148,7 @@ wait_for_next_loop:
 
 	ioctl(tshift->ts.vid_fd, AMSTREAM_IOC_TRICKMODE, TRICKMODE_NONE);
 	AM_FileEcho(VID_BLACKOUT_FILE, tshift->dev->video_blackout ? "1" : "0");
-
+	AM_DEBUG(1, "[timeshift] timeshift player thread exit end");
 	return NULL;
 }
 
@@ -3744,33 +3810,67 @@ static int aml_get_audio_digital_raw(void)
 	return mode;
 }
 
-static int aml_set_sync_mode(int has_audio, int has_video, int afmt)
+static int aml_calc_sync_mode(AM_AV_Device_t *dev, int has_audio, int has_video, int afmt, int *force_reason)
 {
 	int is_dts_dolby = 0;
+	int ac3_amaster = 0;
+	int is_digital_output = 0;
+	int tsync_mode = 2;
+
+#define VMASTER   0
+#define AMASTER   1
+#define PCRMASTER 2
+
+	if (force_reason)
+		*force_reason = FORCE_NONE;
+
+#ifdef ANDROID
+	if ((afmt == AFORMAT_AC3) || (afmt == AFORMAT_EAC3)) {
+		char buf[32];
+		property_get(AC3_AMASTER_PROP, buf, "0");
+		if (!strcmp(buf, "1"))
+			ac3_amaster = 1;
+	}
+#endif
 
 	if (afmt == AFORMAT_AC3 ||
 		afmt == AFORMAT_DTS ||
 		afmt == AFORMAT_EAC3) {
 		is_dts_dolby = 1;
 	}
-	AM_DEBUG(1, "aml_set_sync_mode:-----------1\n");
-#ifdef ANDROID
-	if (aml_get_audio_digital_raw() == 0 && has_audio) {
-		AM_FileEcho(TSYNC_MODE_FILE, "1");
-	} else if (has_video && !has_audio) {
-		AM_FileEcho(TSYNC_MODE_FILE, "0");
-	} else {
-		AM_FileEcho(TSYNC_MODE_FILE, "1");
-	}
-#else
-	if (has_audio && is_dts_dolby) {
-		AM_FileEcho(TSYNC_MODE_FILE, "1");
-	} else {
-		AM_FileEcho(TSYNC_MODE_FILE, "0");
-	}
-#endif
 
-	return 0;
+	tsync_mode = PCRMASTER;
+
+	if (ac3_amaster) {
+		//force
+		tsync_mode = AMASTER;
+		if (force_reason)
+			*force_reason = FORCE_AC3_AMASTER;
+	}
+
+	//no pcrmaster for timeshifting
+	if ((tsync_mode == PCRMASTER) && (dev->mode == AV_TIMESHIFT))
+		tsync_mode = AMASTER;
+
+	if ((aml_get_audio_digital_raw() != 0) && is_dts_dolby)
+		tsync_mode = AMASTER;
+
+	if ((tsync_mode == AMASTER) && !has_audio)
+		tsync_mode = VMASTER;
+
+	if (afmt == AFORMAT_DRA && has_audio)
+		tsync_mode = AMASTER;
+
+	return tsync_mode;
+}
+
+static int aml_set_sync_mode(AM_AV_Device_t *dev, int mode)
+{
+	char mode_str[4];
+	set_first_frame_nosync();
+	snprintf(mode_str, 4, "%d", mode);
+	AM_DEBUG(1, "set sync mode: %d", mode);
+	return AM_FileEcho(TSYNC_MODE_FILE, mode_str);
 }
 
 static AM_ErrorCode_t aml_start_ts_mode(AM_AV_Device_t *dev, AV_TSPlayPara_t *tp, AM_Bool_t create_thread)
@@ -3779,7 +3879,7 @@ static AM_ErrorCode_t aml_start_ts_mode(AM_AV_Device_t *dev, AV_TSPlayPara_t *tp
 	int val;
 	AM_Bool_t has_video = VALID_VIDEO(tp->vpid, tp->vfmt);
 	AM_Bool_t has_audio = VALID_AUDIO(tp->apid, tp->afmt);
-	AM_Bool_t ac3_amaster = AM_FALSE;
+	int sync_mode, sync_force;
 
 	AM_DEBUG(1, "aml start ts: V[%d:%d] A[%d:%d] P[%d]", tp->vpid, tp->vfmt, tp->apid, tp->afmt, tp->pcrpid);
 
@@ -3787,29 +3887,6 @@ static AM_ErrorCode_t aml_start_ts_mode(AM_AV_Device_t *dev, AV_TSPlayPara_t *tp
 
 	/*patch dec control*/
 	set_dec_control(has_video);
-
-	if ((tp->afmt == AFORMAT_AC3) || (tp->afmt == AFORMAT_EAC3))
-	{
-		char buf[32];
-#ifdef ANDROID
-		property_get(AC3_AMASTER_PROP, buf, "0");
-#endif
-		if (!strcmp(buf, "1"))
-		{
-			ac3_amaster = AM_TRUE;
-		}
-	}
-
-	if (has_video && has_audio && !ac3_amaster)
-	{
-		AM_DEBUG(1, "%s, enable pcr_master", __FUNCTION__);
-		gAVPcrEnable = AM_TRUE;
-	}
-	else
-	{
-		AM_DEBUG(1, "%s, disable pcr_master", __FUNCTION__);
-		gAVPcrEnable = AM_FALSE;
-	}
 
 #ifndef ENABLE_PCR
 	if (ts->vid_fd != -1){
@@ -3894,8 +3971,6 @@ static AM_ErrorCode_t aml_start_ts_mode(AM_AV_Device_t *dev, AV_TSPlayPara_t *tp
 	}
 #endif
 
-
-
 	if (has_video) {
 		val = tp->vfmt;
 		if (ioctl(ts->fd, AMSTREAM_IOC_VFORMAT, val) == -1)
@@ -3967,7 +4042,9 @@ static AM_ErrorCode_t aml_start_ts_mode(AM_AV_Device_t *dev, AV_TSPlayPara_t *tp
 	}
 
 //#ifdef ENABLE_PCR
-	if (gAVPcrEnable == AM_TRUE) {
+	sync_mode = aml_calc_sync_mode(dev, has_audio, has_video, tp->afmt, &sync_force);
+
+	if ((sync_force != FORCE_AC3_AMASTER)) {
 		if (tp->pcrpid && (tp->pcrpid < 0x1fff)) {
 			val = tp->pcrpid;
 			if (ioctl(ts->fd, AMSTREAM_IOC_PCRID, val) == -1)
@@ -3976,13 +4053,11 @@ static AM_ErrorCode_t aml_start_ts_mode(AM_AV_Device_t *dev, AV_TSPlayPara_t *tp
 				return AM_AV_ERR_SYS;
 			}
 		}
-		aml_set_sync_mode(has_audio, has_video, tp->afmt);
-		/*AM_FileEcho(TSYNC_MODE_FILE, "2");*/
-	} else {
-		aml_set_sync_mode(has_audio, has_video, tp->afmt);
 	}
 
-	if (has_audio && !ac3_amaster) {
+	aml_set_sync_mode(dev, sync_mode);
+
+	if (has_audio && (sync_force != FORCE_AC3_AMASTER)) {
 		if (!show_first_frame_nosync()) {
 #ifdef ANDROID
 			//property_set("sys.amplayer.drop_pcm", "1");
@@ -4047,10 +4122,7 @@ static int aml_close_ts_mode(AM_AV_Device_t *dev, AM_Bool_t destroy_thread)
 	//property_set("sys.amplayer.drop_pcm", "0");
 #endif
 	AM_FileEcho(ENABLE_RESAMPLE_FILE, "0");
-	if (gAVPcrEnable == AM_TRUE)
-	{
-		AM_FileEcho(TSYNC_MODE_FILE, "0");
-	}
+	AM_FileEcho(TSYNC_MODE_FILE, "0");
 //#endif /*ENABLE_PCR*/
 
 	//set_arc_freq(0);
@@ -4058,21 +4130,23 @@ static int aml_close_ts_mode(AM_AV_Device_t *dev, AM_Bool_t destroy_thread)
 	/*unpatch dec control*/
 	set_dec_control(AM_FALSE);
 
+	AM_DEBUG(1, "close ts mode end.");
 	return 0;
 }
 
-/**\brief 读取PTS值*/
-static AM_ErrorCode_t aml_get_pts(const char *class_file,  uint32_t *pts)
+
+static inline AM_AV_VideoAspectRatio_t
+convert_aspect_ratio(enum E_ASPECT_RATIO euAspectRatio)
 {
-	char buf[32];
-
-	if (AM_FileRead(class_file, buf, sizeof(buf)) == AM_SUCCESS)
-	{
-		*pts = (uint32_t)atol(buf);
-		return AM_SUCCESS;
+	switch (euAspectRatio) {
+	case ASPECT_RATIO_16_9:
+		return AM_AV_VIDEO_ASPECT_16_9;
+	case ASPECT_RATIO_4_3:
+		return AM_AV_VIDEO_ASPECT_4_3;
+	default:
+		return AM_AV_VIDEO_ASPECT_AUTO;
 	}
-
-	return AM_FAILURE;
+	return AM_AV_VIDEO_ASPECT_AUTO;
 }
 
 int am_av_restart_pts_repeat_count = 2;
@@ -4115,7 +4189,8 @@ static void* aml_av_monitor_thread(void *arg)
 	int apts_discontinue = 0, vpts_discontinue = 0;
 	struct am_io_param astatus;
 	struct am_io_param vstatus;
-	int vdec_status, frame_width, frame_height;
+	int vdec_status, frame_width, frame_height, aspect_ratio;
+	int frame_width_old = -1, frame_height_old = -1, aspect_ratio_old = -1;
 	struct timespec rt;
 	char buf[32];
 	AM_Bool_t is_avs_plus = AM_FALSE;
@@ -4168,9 +4243,8 @@ static void* aml_av_monitor_thread(void *arg)
 	adec_start = (adec_handle != NULL);
 #endif
 
-	//AM_FileEcho(VID_BLACKOUT_FILE, "0");
-	AM_FileEcho(VID_BLACKOUT_FILE, dev->video_blackout ? "1" : "0");
-	AM_FileEcho(VDEC_H264_FATAL_ERROR_RESET_FILE, "1");
+	if (dev->mode != AV_TIMESHIFT)
+		AM_FileEcho(VID_BLACKOUT_FILE, dev->video_blackout ? "1" : "0");
 
 	pthread_mutex_lock(&gAVMonLock);
 
@@ -4213,8 +4287,7 @@ static void* aml_av_monitor_thread(void *arg)
 		//switch audio pid or fmt
 		if (dev->audio_switch == AM_TRUE)
 		{
-			if (dev->mode == AV_PLAY_TS || dev->mode == AV_INJECT)
-				aml_switch_ts_audio_fmt(dev);
+			aml_switch_ts_audio_fmt(dev);
 			dev->audio_switch = AM_FALSE;
 		}
 
@@ -4285,7 +4358,30 @@ static void* aml_av_monitor_thread(void *arg)
 				vdec_status = vstatus.vstatus.status;
 				frame_width = vstatus.vstatus.width;
 				frame_height= vstatus.vstatus.height;
+				aspect_ratio = vstatus.vstatus.euAspectRatio;
 				//AM_DEBUG(1, "vdec width %d height %d status 0x%08x", frame_width, frame_height, vdec_status);
+				if (!no_video) {
+					if (frame_width != frame_width_old || frame_height != frame_height_old) {
+						AM_DEBUG(1, "[avmon] video resolution changed: %dx%d -> %dx%d",
+							frame_width_old, frame_height_old,
+							frame_width, frame_height);
+						frame_width_old = frame_width;
+						frame_height_old = frame_height;
+						{
+							AM_AV_VideoStatus_t vstatus;
+							memset(&vstatus, 0, sizeof(vstatus));
+							vstatus.src_w = frame_width;
+							vstatus.src_h = frame_height;
+							AM_EVT_Signal(dev->dev_no, AM_AV_EVT_VIDEO_RESOLUTION_CHANGED, &vstatus);
+						}
+					}
+					if (aspect_ratio != aspect_ratio_old) {
+						AM_DEBUG(1, "[avmon] video aspect ratio changed: %d -> %d(kernel's definition)",
+							aspect_ratio_old, aspect_ratio);
+						aspect_ratio_old = aspect_ratio;
+						AM_EVT_Signal(dev->dev_no, AM_AV_EVT_VIDEO_ASPECT_RATIO_CHANGED, (void*)convert_aspect_ratio(aspect_ratio));
+					}
+				}
 			} else {
 				vdec_status = 0;
 				frame_width = 0;
@@ -4438,6 +4534,8 @@ static void* aml_av_monitor_thread(void *arg)
 				ioctl(ts->fd, AMSTREAM_IOC_AUDIO_INFO, (unsigned long)&info);
 
 				audio_ops->adec_start_decode(ts->fd, tp->afmt, has_video, &ts->adec);
+				if (VALID_PID(tp->sub_apid))
+					aml_set_audio_ad(dev, 1, tp->sub_apid, tp->sub_afmt);
 
 				if (av_paused) {
 					audio_ops->adec_pause_decode(ts->adec);
@@ -4540,14 +4638,11 @@ static void* aml_av_monitor_thread(void *arg)
 				resample = 1;
 
 			if (has_audio && (abuf_level * 5 > abuf_size * 4))
-			{
 				resample = 1;
-			}
 
 			if (has_video && (vbuf_level * 5 > vbuf_size * 4))
-			{
 				resample = 1;
-			}
+
 #ifdef ENABLE_AUDIO_RESAMPLE
 			if (resample != resample_type) {
 				if (resample != next_resample_type) {
@@ -4595,6 +4690,8 @@ static void* aml_av_monitor_thread(void *arg)
 			if (adec_start) {
 				audio_ops->adec_start_decode(ts->fd, tp->afmt, has_video, &ts->adec);
 				AM_DEBUG(1, "[avmon] start audio decoder vlevel %d alevel %d", vbuf_level, abuf_level);
+				if (VALID_PID(tp->sub_apid))
+				    aml_set_audio_ad(dev, 1, tp->sub_apid, tp->sub_afmt);
 			}
 		}
 #endif /*!defined ENABLE_PCR*/
@@ -4718,7 +4815,7 @@ static void* aml_av_monitor_thread(void *arg)
 
 		//AM_DEBUG(3,"no_audio = %d, dmx_a_stop = %d, a_stop= %d, no_video=%d, dmx_v_stop=%d, v_stop=%d, abuf_empty=%d, vbuf_empty=%d\n",no_audio_data,dmx_apts_stop_dur,apts_stop_dur, no_video_data, dmx_vpts_stop_dur, vpts_stop_dur, abuf_level_empty_dur,vbuf_level_empty_dur);
 
-		if (no_audio_data && dmx_apts_stop_dur == 0) {
+		if (has_audio && no_audio_data && dmx_apts_stop_dur == 0) {
 			no_audio_data = AM_FALSE;
 			audio_scrambled = AM_FALSE;
 			no_data_evt = AM_FALSE;
@@ -4726,7 +4823,7 @@ static void* aml_av_monitor_thread(void *arg)
 			AM_DEBUG(1, "[avmon] audio data resumed");
 		}
 
-		if (no_video_data && dmx_vpts_stop_dur == 0) {
+		if (has_video && no_video_data && dmx_vpts_stop_dur == 0) {
 			no_video_data = AM_FALSE;
 			video_scrambled = AM_FALSE;
 			no_data_evt = AM_FALSE;
@@ -4750,8 +4847,10 @@ static void* aml_av_monitor_thread(void *arg)
 			vdec_stop_dur  = 0;
 		}
 
-		if (has_video && (vdec_stop_dur > NO_DATA_CHECK_TIME)) {
-			need_replay = AM_TRUE;
+		if (dev->mode != AV_TIMESHIFT
+			&& (has_video && (vdec_stop_dur > NO_DATA_CHECK_TIME))) {
+			if (AM_ABS(checkin_firstapts - checkin_firstvpts) < TIME_UNIT90K * 5)
+				need_replay = AM_TRUE;
 			AM_DEBUG(1, "[avmon] apts_dmx_stop: %d arp_stop: %d vpts_dmx_stop: %d vrp_stop: %d",
 					dmx_apts_stop_dur, arp_stop_dur, dmx_vpts_stop_dur, vrp_stop_dur);
 		}
@@ -4764,7 +4863,7 @@ static void* aml_av_monitor_thread(void *arg)
 			if (has_audio && (abuf_level * 5 > abuf_size * 4))
 			{
 				need_replay = AM_TRUE;
-				AM_DEBUG(1, "[avmon] 2 replay ts vlevel %d vbuf_size %d",abuf_level*6, abuf_size*5);
+				AM_DEBUG(1, "[avmon] 2 replay ts alevel %d abuf_size %d",abuf_level*6, abuf_size*5);
 			}
 		}
 		//if(adec_start && !av_paused && has_amaster && !apts_stop_dur && !vpts_stop_dur && (vmaster_dur > VMASTER_REPLAY_TIME))
@@ -4781,7 +4880,7 @@ static void* aml_av_monitor_thread(void *arg)
 			AM_DEBUG(1, "[avmon] H264 fatal error");
 			need_replay = AM_TRUE;
 		}
-
+#ifndef USE_ADEC_IN_DVB
 #ifdef ANDROID
 		if (AM_FileRead(TSYNCPCR_RESETFLAG_FILE, buf, sizeof(buf)) >= 0) {
 			int val = 0;
@@ -4792,10 +4891,10 @@ static void* aml_av_monitor_thread(void *arg)
 			}
 		}
 
-		AM_DEBUG(1, "tsync_mode:%d--vbuf_level--0x%08x---- abuf_level---0x%08x",
-			tsync_mode,vbuf_level,abuf_level);
+		//AM_DEBUG(1, "tsync_mode:%d--vbuf_level--0x%08x---- abuf_level---0x%08x",
+		//	tsync_mode,vbuf_level,abuf_level);
 #endif
-
+#endif
 		if (!av_paused && dev->mode == AV_INJECT) {
 			if (has_video && (vbuf_level < DEC_STOP_VIDEO_LEVEL))
 				av_paused = AM_TRUE;
@@ -4844,10 +4943,12 @@ static void* aml_av_monitor_thread(void *arg)
 
 		if (has_audio && (dmx_apts < apts)) {
 			apts_discontinue = 1;
+			AM_DEBUG(1, "[avmon] dmx_apts:%d,apts:%d",dmx_apts,apts);
 		}
 
 		if (has_video && (dmx_vpts < vpts)) {
 			vpts_discontinue = 1;
+			AM_DEBUG(1, "[avmon] dmx_vpts:%d,vpts:%d",dmx_vpts,vpts);
 		}
 
 		if (apts_discontinue && vpts_discontinue) {
@@ -4857,7 +4958,7 @@ static void* aml_av_monitor_thread(void *arg)
 			vpts_discontinue = 0;
 
 			AM_DMX_GetScrambleStatus(0, sf);
-			if (sf[0] == 0 && sf[1] == 0) {
+			if (sf[0] == 0 && sf[1] == 0 && is_dts_dolby) {
 				need_replay = AM_TRUE;
 			}
 		}
@@ -4979,8 +5080,8 @@ static void* aml_av_monitor_thread(void *arg)
 	}
 #endif
 
-	AM_FileEcho(VDEC_H264_FATAL_ERROR_RESET_FILE, "0");
-	AM_FileEcho(VID_BLACKOUT_FILE, dev->video_blackout ? "1" : "0");
+	if (dev->mode != AV_TIMESHIFT)
+		AM_FileEcho(VID_BLACKOUT_FILE, dev->video_blackout ? "1" : "0");
 
 	if (bypass_di) {
 		AM_FileEcho(DI_BYPASS_FILE, "0");
@@ -5312,6 +5413,9 @@ static AM_ErrorCode_t aml_ts_source(AM_AV_Device_t *dev, AM_AV_TSSource_t src)
 #endif
 		case AM_AV_TS_SRC_HIU:
 			cmd = "hiu";
+		break;
+		case AM_AV_TS_SRC_HIU1:
+			cmd = "hiu1";
 		break;
 		case AM_AV_TS_SRC_DMX0:
 			cmd = "dmx0";
@@ -5746,6 +5850,24 @@ end:
 	return AM_AV_ERR_NOT_SUPPORTED;
 #endif
 }
+static AM_Bool_t aml_is_audio_valid(AM_AV_Device_t *dev)
+{
+	AM_Bool_t has_audio = AM_FALSE;
+	AV_TimeshiftData_t *tshift = NULL;
+
+	if ((dev->mode & AV_PLAY_TS) || (dev->mode & AV_INJECT))
+	{
+		has_audio = VALID_AUDIO(dev->ts_player.play_para.apid, dev->ts_player.play_para.afmt);
+	}
+	else if(dev->mode & AV_TIMESHIFT)
+	{
+		tshift = dev->timeshift_player.drv_data;
+		if (tshift != NULL)
+			has_audio =  VALID_AUDIO(tshift->tp.apid, tshift->tp.afmt);
+	}
+
+	return has_audio;
+}
 
 static AM_ErrorCode_t aml_get_astatus(AM_AV_Device_t *dev, AM_AV_AudioStatus_t *para)
 {
@@ -5755,7 +5877,7 @@ static AM_ErrorCode_t aml_get_astatus(AM_AV_Device_t *dev, AM_AV_AudioStatus_t *
 	char buf[32];
 
 	void *adec = NULL;
-	AM_Bool_t has_audio = VALID_AUDIO(dev->ts_player.play_para.apid, dev->ts_player.play_para.afmt);
+	AM_Bool_t has_audio = aml_is_audio_valid(dev);
 
 	if (!has_audio)
 	{
@@ -5874,13 +5996,30 @@ get_fail:
 	pthread_mutex_unlock(&gAVMonLock);
 	return AM_FAILURE;
 }
+static AM_Bool_t aml_is_video_valid(AM_AV_Device_t *dev)
+{
+	AM_Bool_t has_video = AM_FALSE;
+	AV_TimeshiftData_t *tshift = NULL;
 
+	if ((dev->mode & AV_PLAY_TS) || (dev->mode & AV_INJECT))
+	{
+		has_video = VALID_VIDEO(dev->ts_player.play_para.vpid, dev->ts_player.play_para.vfmt);
+	}
+	else if(dev->mode & AV_TIMESHIFT)
+	{
+		tshift = dev->timeshift_player.drv_data;
+		if (tshift != NULL)
+			has_video =  VALID_VIDEO(tshift->tp.vpid, tshift->tp.vfmt);
+	}
+
+	return has_video;
+}
 static AM_ErrorCode_t aml_get_vstatus(AM_AV_Device_t *dev, AM_AV_VideoStatus_t *para)
 {
 	struct am_io_param vstatus;
 	char buf[32];
 	int fd, rc;
-	AM_Bool_t has_video = VALID_VIDEO(dev->ts_player.play_para.vpid, dev->ts_player.play_para.vfmt);
+	AM_Bool_t has_video = aml_is_video_valid(dev);
 
 	if (!has_video)
 	{
@@ -5908,6 +6047,7 @@ static AM_ErrorCode_t aml_get_vstatus(AM_AV_Device_t *dev, AM_AV_VideoStatus_t *
 	para->src_w     = vstatus.vstatus.width;
 	para->src_h     = vstatus.vstatus.height;
 	para->fps       = vstatus.vstatus.fps;
+	para->vid_ratio = convert_aspect_ratio(vstatus.vstatus.euAspectRatio);
 	para->frames    = 1;
 	para->interlaced  = 1;
 
@@ -6412,9 +6552,13 @@ static AM_ErrorCode_t aml_switch_ts_audio_legacy(AM_AV_Device_t *dev, uint16_t a
 #endif
 	}
 	AM_FileEcho(ENABLE_RESAMPLE_FILE, "1");
-	aml_set_sync_mode(audio_valid, has_video, afmt);
-	/*AM_FileEcho(TSYNC_MODE_FILE, "2");*/
+	aml_set_sync_mode(dev,
+		aml_calc_sync_mode(dev, audio_valid, has_video, afmt, NULL));
 	audio_ops->adec_start_decode(fd, afmt, has_video, &ts->adec);
+	uint16_t sub_apid = dev->ts_player.play_para.sub_apid ;
+	AM_AV_AFormat_t sub_afmt = dev->ts_player.play_para.sub_afmt;
+	if (VALID_PID(sub_apid))
+		aml_set_audio_ad(dev, 1, sub_apid, sub_afmt);
 #endif /*ENABLE_PCR*/
 
 	/*Start Audio*/
@@ -6425,41 +6569,56 @@ static AM_ErrorCode_t aml_switch_ts_audio_legacy(AM_AV_Device_t *dev, uint16_t a
 
 static AM_ErrorCode_t aml_switch_ts_audio_fmt(AM_AV_Device_t *dev)
 {
-	int fd = -1;
-	uint16_t apid;
-	AM_AV_AFormat_t afmt;
-	apid = dev->ts_player.play_para.apid ;
-	afmt = dev->ts_player.play_para.afmt;
-	AM_Bool_t audio_valid = VALID_AUDIO(apid, afmt);
-	AM_Bool_t has_video = VALID_VIDEO(dev->ts_player.play_para.vpid, dev->ts_player.play_para.vfmt);
+	AM_Bool_t has_audio = AM_FALSE;
+	AM_Bool_t has_video = AM_FALSE;
 	AV_TSData_t *ts = NULL;
+	AV_TSPlayPara_t *tp = NULL;
+	int sub_apid;
+	AM_AV_AFormat_t sub_afmt;
 
-	AM_DEBUG(1, "switch ts audio: A[%d:%d]", apid, afmt);
-
-	if (dev->ts_player.drv_data) {
-		ts = (AV_TSData_t *)dev->ts_player.drv_data;
-		fd = ts->fd;
+	switch (dev->mode) {
+		case AV_PLAY_TS:
+			ts = (AV_TSData_t *)dev->ts_player.drv_data;
+			tp = &dev->ts_player.play_para;
+			sub_apid = tp->sub_apid;
+			sub_afmt = tp->sub_afmt;
+			break;
+		case AV_TIMESHIFT: {
+			AV_TimeshiftData_t *tshift_d = (AV_TimeshiftData_t *)dev->timeshift_player.drv_data;
+			ts = &tshift_d->ts;
+			tp = &tshift_d->tp;
+			sub_apid = dev->timeshift_player.para.sub_aud_pid;
+			sub_afmt = dev->timeshift_player.para.sub_aud_fmt;
+			}break;
+		default:
+			AM_DEBUG(1, "switch audio not support for AV mode(%d)", dev->mode);
+			return AM_AV_ERR_ILLEGAL_OP;
 	}
 
-	if (fd < 0)
+	AM_DEBUG(1, "do switch ts audio: A[%d:%d]", tp->apid, tp->afmt);
+
+	if (ts->fd < 0)
 	{
-		AM_DEBUG(1, "ts_player fd < 0, error!");
+		AM_DEBUG(1, "amstream fd < 0, error!");
 		return AM_AV_ERR_SYS;
 	}
+
+	has_audio = VALID_AUDIO(tp->apid, tp->afmt);
+	has_video = VALID_VIDEO(tp->vpid, tp->vfmt);
 
 	aml_set_ad_source(&ts->ad, 0, 0, 0, ts->adec);
 	audio_ops->adec_set_decode_ad(0, 0, 0, ts->adec);
 	audio_ops->adec_stop_decode(&ts->adec);
 
 	/*Set Audio PID & fmt*/
-	if (audio_valid)
+	if (has_audio)
 	{
-		if (ioctl(fd, AMSTREAM_IOC_AFORMAT, (int)afmt) == -1)
+		if (ioctl(ts->fd, AMSTREAM_IOC_AFORMAT, (int)tp->afmt) == -1)
 		{
 			AM_DEBUG(1, "set audio format failed");
 			return AM_AV_ERR_SYS;
 		}
-		if (ioctl(fd, AMSTREAM_IOC_AID, (int)apid) == -1)
+		if (ioctl(ts->fd, AMSTREAM_IOC_AID, (int)tp->apid) == -1)
 		{
 			AM_DEBUG(1, "set audio PID failed");
 			return AM_AV_ERR_SYS;
@@ -6471,7 +6630,7 @@ static AM_ErrorCode_t aml_switch_ts_audio_fmt(AM_AV_Device_t *dev)
 	}
 
 	/*reset audio*/
-	if (ioctl(fd, AMSTREAM_IOC_AUDIO_RESET, 0) == -1)
+	if (ioctl(ts->fd, AMSTREAM_IOC_AUDIO_RESET, 0) == -1)
 	{
 		AM_DEBUG(1, "audio reset failed");
 		return AM_AV_ERR_SYS;
@@ -6484,12 +6643,10 @@ static AM_ErrorCode_t aml_switch_ts_audio_fmt(AM_AV_Device_t *dev)
 #endif
 	}
 	AM_FileEcho(ENABLE_RESAMPLE_FILE, "1");
-	aml_set_sync_mode(audio_valid, has_video, afmt);
-	/*AM_FileEcho(TSYNC_MODE_FILE, "2");*/
-	audio_ops->adec_start_decode(fd, afmt, has_video, &ts->adec);
+	aml_set_sync_mode(dev,
+		aml_calc_sync_mode(dev, has_audio, has_video, tp->afmt, NULL));
+	audio_ops->adec_start_decode(ts->fd, tp->afmt, has_video, &ts->adec);
 
-	uint16_t sub_apid = dev->ts_player.play_para.sub_apid ;
-	AM_AV_AFormat_t sub_afmt = dev->ts_player.play_para.sub_afmt;
 	if (VALID_PID(sub_apid))
 		aml_set_audio_ad(dev, 1, sub_apid, sub_afmt);
 #endif /*ENABLE_PCR*/
@@ -6499,8 +6656,21 @@ static AM_ErrorCode_t aml_switch_ts_audio_fmt(AM_AV_Device_t *dev)
 
 static AM_ErrorCode_t aml_switch_ts_audio(AM_AV_Device_t *dev, uint16_t apid, AM_AV_AFormat_t afmt)
 {
-	AV_TSPlayPara_t *tp = &dev->ts_player.play_para;
+	AV_TSPlayPara_t *tp = NULL;
 	AM_ErrorCode_t err = AM_SUCCESS;
+
+	switch (dev->mode) {
+		case AV_PLAY_TS:
+			tp = &dev->ts_player.play_para;
+			break;
+		case AV_TIMESHIFT: {
+			AV_TimeshiftData_t *tshift_d = (AV_TimeshiftData_t *)dev->timeshift_player.drv_data;
+			tp = &tshift_d->tp;
+			}break;
+		default:
+			AM_DEBUG(1, "switch audio not support for AV mode(%d)", dev->mode);
+			return AM_AV_ERR_ILLEGAL_OP;
+	}
 
 	AM_DEBUG(1, "switch ts audio: A[%d:%d]", apid, afmt);
 
@@ -6745,6 +6915,7 @@ static AM_ErrorCode_t aml_set_audio_ad(AM_AV_Device_t *dev, int enable, uint16_t
 		return AM_AV_ERR_ILLEGAL_OP;
 	}
 
+
 	/*assume ad is enabled if ad handle is not NULL*/
 	if ((enable && *pad && (apid == sub_apid) && (afmt == sub_afmt))
 		|| (!enable && !*pad))
@@ -6762,6 +6933,7 @@ static AM_ErrorCode_t aml_set_audio_ad(AM_AV_Device_t *dev, int enable, uint16_t
 		aml_set_ad_source(pad, 1, apid, afmt, adec);
 
 	} else if (!enable && pad && *pad) {
+
 
 		/*shutdown date source*/
 		aml_set_ad_source(pad, 0, apid, afmt, adec);
@@ -6864,5 +7036,58 @@ static void aml_set_audio_cb(AM_AV_Device_t *dev,AM_AV_Audio_CB_t cb,void *user_
 		audio_ops = &callback_audio_drv;
 #endif
 	}
+}
+
+static AM_ErrorCode_t aml_get_pts(AM_AV_Device_t *dev, int type, uint64_t *pts)
+{
+#define GAP_10SEC (90000*10)/*10s*/
+	char pts_buf[32];
+	const char *pts_file, *pts_bit32_file, *pts_tsync_file;
+	uint32_t pts_dmx = 0, pts_dmx_bit32 = 0, pts_dmx_2 = 0, pts_tsync = 0;
+	int retry = 0;
+
+	switch (type) {
+	case 1:
+		pts_file = AUDIO_DMX_PTS_FILE;
+		pts_bit32_file = AUDIO_DMX_PTS_BIT32_FILE;
+		pts_tsync_file = AUDIO_PTS_FILE;
+		break;
+	default:
+		pts_file = VIDEO_DMX_PTS_FILE;
+		pts_bit32_file = VIDEO_DMX_PTS_BIT32_FILE;
+		pts_tsync_file = VIDEO_PTS_FILE;
+		break;
+	}
+
+	retry = 2;
+	do {
+		memset(pts_buf, 0, sizeof(pts_buf));
+		if (AM_FileRead(pts_file, pts_buf, sizeof(pts_buf)) >= 0)
+			sscanf(pts_buf, "%d", &pts_dmx);
+
+		memset(pts_buf, 0, sizeof(pts_buf));
+		if (AM_FileRead(pts_bit32_file, pts_buf, sizeof(pts_buf)) >= 0)
+			sscanf(pts_buf, "%d", &pts_dmx_bit32);
+
+		memset(pts_buf, 0, sizeof(pts_buf));
+		if (AM_FileRead(pts_file, pts_buf, sizeof(pts_buf)) >= 0)
+			sscanf(pts_buf, "%d", &pts_dmx_2);
+	} while (retry-- && (abs(pts_dmx_2 - pts_dmx) > GAP_10SEC));
+
+	if ((abs(pts_dmx_2 - pts_dmx) > GAP_10SEC)) {
+		AM_DEBUG(1, "something wrong with the stream's pts");
+		*pts = 0L;
+		return AM_SUCCESS;
+	}
+
+	memset(pts_buf, 0, sizeof(pts_buf));
+	if (AM_FileRead(pts_tsync_file, pts_buf, sizeof(pts_buf)) >= 0)
+		sscanf(pts_buf, "%i", &pts_tsync);
+
+	*pts = pts_tsync;
+	if (pts_dmx_bit32 && (abs(pts_dmx_2 - pts_tsync) < (GAP_10SEC * 3)))
+		*pts += 0x100000000L;
+
+	return AM_SUCCESS;
 }
 

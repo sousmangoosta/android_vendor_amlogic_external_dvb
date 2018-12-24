@@ -72,6 +72,8 @@ typedef enum
 /****************************************************************************
  * Type definitions
  ***************************************************************************/
+/**Isdb handle parser's handle*/
+typedef void* AM_ISDB_Handle_t;
 
 /**Close caption parser's handle*/
 typedef void* AM_CC_Handle_t;
@@ -216,7 +218,9 @@ typedef struct
 	int                 bypass_cc_enable; /**< Bypass CC data flag*/
 	int                 data_timeout;  /**< Data timeout value in ms*/
 	int                 switch_timeout;/**< Caption 1/2 swith timeout in ms.*/
+	unsigned int       decoder_param;
 	void               *user_data;     /**< User defined data*/
+	char                lang[10];
 	AM_CC_Input_t       input;         /**< Input type.*/
 	AM_CC_VBIProgInfoCb_t pinfo_cb;    /**< VBI program information callback.*/
 	AM_CC_VBINetworkCb_t  network_cb;  /**< VBI network callback.*/

@@ -2387,6 +2387,28 @@ AM_ErrorCode_t AM_SI_ExtractDVBTeletextFromES(dvbpsi_pmt_es_t *es, AM_SI_Teletex
 	return AM_SUCCESS;
 }
 
+AM_ErrorCode_t AM_SI_ExtractDVBIsdbsubtitleFromES(dvbpsi_pmt_es_t *es, AM_SI_IsdbsubtitleInfo_t *sub_info)
+{
+	dvbpsi_descriptor_t *descr;
+
+	AM_SI_LIST_BEGIN(es->p_first_descriptor, descr)
+	if (descr->i_tag == AM_SI_DESCR_ISDBSUBTITLING)
+	{
+		if (descr->p_data[0] == 0 && descr->p_data[1] == 8)
+		{
+			sub_info->isdb_count = 1;
+			sub_info->isdbs[0].pid = es->i_pid;
+			sub_info->isdbs[0].type = 7;
+			memcpy(sub_info->isdbs[0].lang, "isdb", 5);
+			AM_DEBUG(0, "Isdb found and added");
+		}
+	}
+	AM_SI_LIST_END()
+
+	return AM_SUCCESS;
+}
+
+
 AM_ErrorCode_t AM_SI_ExtractATSCCaptionFromES(dvbpsi_pmt_es_t *es, AM_SI_CaptionInfo_t *cap_info)
 {
 	dvbpsi_descriptor_t *descr;
@@ -2417,7 +2439,10 @@ AM_ErrorCode_t AM_SI_ExtractATSCCaptionFromES(dvbpsi_pmt_es_t *es, AM_SI_Caption
 				cap_info->captions[cap_info->caption_count].service_number = tmp_cap->i_caption_service_number;
 				cap_info->captions[cap_info->caption_count].type = tmp_cap->b_digital_cc;
 				cap_info->captions[cap_info->caption_count].pid_or_line21 = tmp_cap->b_digital_cc ? es->i_pid : tmp_cap->b_line21_field;
-				cap_info->captions[cap_info->caption_count].flags = (tmp_cap->b_easy_reader ? 0x80 : 0) | (tmp_cap->b_wide_aspect_ratio ? 0x40 : 0);
+				cap_info->captions[cap_info->caption_count].flags =
+					(tmp_cap->b_easy_reader ? 0x80 : 0) |
+					(tmp_cap->b_wide_aspect_ratio ? 0x40 : 0);
+				cap_info->captions[cap_info->caption_count].private_data = tmp_cap->private_data;
 				if (tmp_cap->i_iso_639_code[0] == 0)
 				{
 					snprintf(cap_info->captions[cap_info->caption_count].lang,
@@ -2430,11 +2455,13 @@ AM_ErrorCode_t AM_SI_ExtractATSCCaptionFromES(dvbpsi_pmt_es_t *es, AM_SI_Caption
 					cap_info->captions[cap_info->caption_count].lang[3] = 0;
 				}
 
-				AM_DEBUG(1, "Add a caption: pid %d, language: %s, digital:%d service:%d",
+				AM_DEBUG(1, "Add a caption: pid %d, language: %s, digital:%d service:%d type %d flags:%x",
 					es->i_pid,
 					cap_info->captions[cap_info->caption_count].lang,
 					cap_info->captions[cap_info->caption_count].type,
-					cap_info->captions[cap_info->caption_count].service_number);
+					cap_info->captions[cap_info->caption_count].service_number,
+					cap_info->captions[cap_info->caption_count].type,
+					cap_info->captions[cap_info->caption_count].flags);
 
 				cap_info->caption_count++;
 			}
@@ -2526,8 +2553,9 @@ AM_ErrorCode_t AM_SI_GetATSCCaptionString(dvbpsi_atsc_caption_service_dr_t *psd,
 						else
 								memcpy(lang, tmp_cap->i_iso_639_code, 3);
 						lang[3] = 0;
-						snprintf(buf, buf_size, "%s,lng:\"%s\",beasy:%d,bwar:%d}",
-								buf, lang, tmp_cap->b_easy_reader, tmp_cap->b_wide_aspect_ratio);
+						snprintf(buf, buf_size, "%s,lng:\"%s\",beasy:%d,bwar:%d,private_data:%d}",
+								buf, lang, tmp_cap->b_easy_reader, tmp_cap->b_wide_aspect_ratio,
+								tmp_cap->private_data);
 				} else {
 						snprintf(buf, buf_size, "%s{bdig:0,l21:%d}", buf, tmp_cap->b_line21_field);
 				}
