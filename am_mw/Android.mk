@@ -158,17 +158,18 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/../include/am_adp\
 
 ifeq ($(BOARD_VNDK_VERSION), current)
 ifeq ($(BOARD_COMPILE_IN_SYSTEM), true)
-    LOCAL_C_INCLUDES += external/icu/icu4c/source/common
-    LOCAL_SHARED_LIBRARIES+= libzvbi libsqlite libam_adp liblog libdl libc libcutils libicui18n liblog libdl libc libcutils
+    LOCAL_C_INCLUDES += external/icu/libandroidicu/include
+    LOCAL_SHARED_LIBRARIES+= libzvbi libsqlite libam_adp liblog libdl libc libcutils libandroidicu liblog libdl libc libcutils
 else
     LOCAL_CFLAGS += -DUSE_VENDOR_ICU
-    LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../icu/icu4c/source/common
+    #LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../icu/icu4c/source/common
+    LOCAL_C_INCLUDES += external/icu/libandroidicu/include
     LOCAL_STATIC_LIBRARIES+= libsqlite libam_adp libzvbi
-    LOCAL_SHARED_LIBRARIES+= liblog libdl libc libcutils libicuuc
+    LOCAL_SHARED_LIBRARIES+= liblog libdl libc libcutils libandroidicu
 endif
 else
-LOCAL_C_INCLUDES += external/icu/icu4c/source/common
-LOCAL_SHARED_LIBRARIES+= libzvbi libsqlite libam_adp liblog libdl libc libcutils libicui18n
+LOCAL_C_INCLUDES += external/icu/libandroidicu/include
+LOCAL_SHARED_LIBRARIES+= libzvbi libsqlite libam_adp liblog libdl libc libcutils libandroidicu
 endif
 ifeq ($(SUPPORT_CAS), y)
 LOCAL_CFLAGS+=-DSUPPORT_CAS

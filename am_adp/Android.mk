@@ -331,14 +331,14 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/../include/am_adp\
 
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 28&& echo OK),OK)
     ifeq ($(BOARD_COMPILE_IN_SYSTEM), true)
-        LOCAL_C_INCLUDES += external/icu/icu4c/source/common
+        LOCAL_C_INCLUDES += external/icu/libandroidicu/include
         LOCAL_SHARED_LIBRARIES+= libcutils liblog libdl libc
-        LOCAL_STATIC_LIBRARIES+= libicuuc_product libicui18n_product
+        LOCAL_STATIC_LIBRARIES+= libandroidicu
     else
         LOCAL_CFLAGS += -DUSE_VENDOR_ICU
-        LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../icu/icu4c/source/common
+        LOCAL_C_INCLUDES += external/icu/libandroidicu/include
         LOCAL_SHARED_LIBRARIES+= libcutils liblog libdl libc
-        LOCAL_STATIC_LIBRARIES+= libicuuc_product libicui18n_product
+        LOCAL_STATIC_LIBRARIES+= libandroidicu
     endif
 else
 LOCAL_C_INCLUDES += external/icu/icu4c/source/common
@@ -493,8 +493,8 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/../include/am_adp\
 
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 28&& echo OK),OK)
 LOCAL_CFLAGS += -DUSE_VENDOR_ICU
-LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../icu/icu4c/source/common
-LOCAL_SHARED_LIBRARIES+=libicuuc libcutils liblog libdl libc libamadec_system
+LOCAL_C_INCLUDES += external/icu/libandroidicu/include
+LOCAL_SHARED_LIBRARIES+=libandroidicu libcutils liblog libdl libc libamadec_system
 else
 LOCAL_C_INCLUDES += external/icu/icu4c/source/common
 LOCAL_SHARED_LIBRARIES+=libicuuc libcutils liblog libdl libc libamadec_system
