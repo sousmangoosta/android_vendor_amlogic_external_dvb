@@ -333,12 +333,12 @@ ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 28&& echo OK),OK)
     ifeq ($(BOARD_COMPILE_IN_SYSTEM), true)
         LOCAL_C_INCLUDES += external/icu/libandroidicu/include
         LOCAL_SHARED_LIBRARIES+= libcutils liblog libdl libc
-        LOCAL_STATIC_LIBRARIES+= libandroidicu
+        LOCAL_STATIC_LIBRARIES+= libandroidicu_static
     else
         LOCAL_CFLAGS += -DUSE_VENDOR_ICU
         LOCAL_C_INCLUDES += external/icu/libandroidicu/include
         LOCAL_SHARED_LIBRARIES+= libcutils liblog libdl libc
-        LOCAL_STATIC_LIBRARIES+= libandroidicu
+        LOCAL_STATIC_LIBRARIES+= libandroidicu_static
     endif
 else
 LOCAL_C_INCLUDES += external/icu/icu4c/source/common
